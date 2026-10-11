@@ -431,7 +431,8 @@ impl ModelRuntime {
         ids
     }
 
-    fn models(&self) -> Models {
+    /// Shared collection used by embedded agents and this runtime.
+    pub fn models(&self) -> Models {
         self.0.models.clone()
     }
 

@@ -15,10 +15,8 @@
 //! Semantics:
 //! - A missing file is an empty document (upstream `loadAuth`'s
 //!   `existsSync` guard).
-//! - An unparsable file (bad JSON, wrong credential shape) is an *empty*
-//!   document, not an error — upstream `loadAuth` catches the parse failure
-//!   and returns `{}`; a later write then replaces the content (exactly what
-//!   upstream `login` does against a corrupt file).
+//! - An unparsable file fails visibly so a later write cannot replace saved
+//!   credentials with a fresh document.
 //! - Every write rewrites the whole document (`saveAuth` serializes the full
 //!   map; `AuthStorage.modify` writes `{ ...currentData, [provider]: next }`).
 //! - `delete` always rewrites the document, even when the key was absent
@@ -37,8 +35,7 @@
 //!   `AuthStorage.read` layer; app-owned, lands with the pi-rust app).
 //! - No cross-process file lock. Upstream `cli.ts` and the `oauth.ts`
 //!   harness lock nothing; the coding-agent's `proper-lockfile` is app-level.
-//!   Within one process, per-provider writes serialize like
-//!   [`InMemoryCredentialStore`](super::credential_store::InMemoryCredentialStore).
+//!   Within one process, writes serialize across the whole document.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -57,10 +54,7 @@ type AuthDocument = BTreeMap<String, Credential>;
 /// `loadAuth`/`saveAuth` over one `auth.json` path).
 pub struct FileCredentialStore {
     path: PathBuf,
-    /// Per-provider writer locks, mirroring
-    /// [`InMemoryCredentialStore`](super::credential_store::InMemoryCredentialStore):
-    /// one tiny allocation per provider that ever received a write.
-    locks: Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    lock: Mutex<()>,
 }
 
 impl FileCredentialStore {
@@ -70,7 +64,7 @@ impl FileCredentialStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            locks: Mutex::new(std::collections::HashMap::new()),
+            lock: Mutex::new(()),
         }
     }
 
@@ -79,26 +73,22 @@ impl FileCredentialStore {
         &self.path
     }
 
-    /// Acquire this provider's writer lock, racing the operation's
+    /// Acquire the document writer lock, racing the operation's
     /// cancellation token (same semantics as the in-memory store).
-    async fn lock_provider(
+    async fn lock_document(
         &self,
-        provider_id: &str,
         options: &AuthOperationOptions,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AuthError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, AuthError> {
         options.check()?;
-        let entry = {
-            let mut locks = self.locks.lock().await;
-            std::sync::Arc::clone(locks.entry(provider_id.to_string()).or_default())
-        };
-        tokio::select! {
-            guard = Mutex::lock_owned(entry) => Ok(guard),
+        let guard = tokio::select! {
+            guard = self.lock.lock() => Ok(guard),
             _ = options.cancelled() => Err(AuthError::Cancelled),
-        }
+        }?;
+        options.check()?;
+        Ok(guard)
     }
 
-    /// Upstream `loadAuth`: a missing or unparsable file is an empty
-    /// document; IO failures other than a missing file are storage errors.
+    /// A missing file is empty; malformed saved credentials are an error.
     fn load_document(&self) -> Result<AuthDocument, AuthError> {
         let content = match std::fs::read_to_string(&self.path) {
             Ok(content) => content,
@@ -112,9 +102,12 @@ impl FileCredentialStore {
                 )));
             }
         };
-        // Upstream `JSON.parse` inside a `catch` returning `{}`: a corrupt
-        // document (bad JSON, wrong credential shape) degrades to empty.
-        Ok(serde_json::from_str(&content).unwrap_or_default())
+        serde_json::from_str(&content).map_err(|error| {
+            AuthError::Storage(format!(
+                "invalid saved credentials in {}: {error}",
+                self.path.display()
+            ))
+        })
     }
 
     /// Write a complete owner-only document beside the destination, then
@@ -226,7 +219,7 @@ impl CredentialStore for FileCredentialStore {
         options: &'a AuthOperationOptions,
     ) -> BoxFuture<'a, Result<Option<Credential>, AuthError>> {
         Box::pin(async move {
-            let _guard = self.lock_provider(provider_id, options).await?;
+            let _guard = self.lock_document(options).await?;
             let document = self.load_document()?;
             let current = document.get(provider_id).cloned();
             let next = {
@@ -254,7 +247,7 @@ impl CredentialStore for FileCredentialStore {
         options: &'a AuthOperationOptions,
     ) -> BoxFuture<'a, Result<(), AuthError>> {
         Box::pin(async move {
-            let _guard = self.lock_provider(provider_id, options).await?;
+            let _guard = self.lock_document(options).await?;
             let mut document = self.load_document()?;
             document.remove(provider_id);
             // Upstream `AuthStorage.delete` rewrites the filtered map
@@ -316,24 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_file_degrades_to_an_empty_document() {
-        // Upstream `loadAuth` catches the `JSON.parse` failure and returns
-        // `{}`; reads and lists see an empty store instead of erroring.
+    fn a_corrupt_file_fails_without_losing_saved_credentials() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("auth.json"), "{not json").unwrap();
         let store = store_in(&dir);
-        assert_eq!(
-            futures::executor::block_on(store.read("p1", &no_options())).unwrap(),
-            None
-        );
-        assert_eq!(
-            futures::executor::block_on(store.list(&no_options())).unwrap(),
-            Vec::new()
-        );
+        assert!(futures::executor::block_on(store.read("p1", &no_options())).is_err());
+        assert!(futures::executor::block_on(store.list(&no_options())).is_err());
+        assert!(futures::executor::block_on(store.modify(
+            "p1",
+            Box::new(|_| Box::pin(async { Ok(Some(api_key("new"))) })),
+            &no_options(),
+        ))
+        .is_err());
+        assert_eq!(read_file(&dir), "{not json");
     }
 
     #[test]
-    fn a_shape_invalid_entry_degrades_to_an_empty_document() {
+    fn a_shape_invalid_entry_is_an_error() {
         // The port validates entries against the Credential schema at parse
         // time (upstream cli.ts casts unchecked): an oauth entry missing
         // `expires` is corrupt like a JSON syntax error.
@@ -344,10 +336,7 @@ mod tests {
         )
         .unwrap();
         let store = store_in(&dir);
-        assert_eq!(
-            futures::executor::block_on(store.read("p1", &no_options())).unwrap(),
-            None
-        );
+        assert!(futures::executor::block_on(store.read("p1", &no_options())).is_err());
     }
 
     #[test]
@@ -626,6 +615,98 @@ mod tests {
         // modify would have removed nothing and the writer would have
         // re-written the entry afterwards.
         assert_eq!(read_file(&dir), "{}");
+    }
+
+    #[tokio::test]
+    async fn different_provider_writes_do_not_overwrite_each_other() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(store_in(&dir));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = store.clone();
+        let write_first = tokio::spawn(async move {
+            first
+                .modify(
+                    "openai",
+                    Box::new(move |_| {
+                        Box::pin(async move {
+                            started.send(()).ok();
+                            wait.await.ok();
+                            Ok(Some(api_key("first")))
+                        })
+                    }),
+                    &no_options(),
+                )
+                .await
+                .unwrap();
+        });
+        started_rx.await.unwrap();
+        let second = store.clone();
+        let (entered, mut entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let write_second = tokio::spawn(async move {
+            second
+                .modify(
+                    "anthropic",
+                    Box::new(move |_| {
+                        Box::pin(async move {
+                            entered.send(()).ok();
+                            Ok(Some(api_key("second")))
+                        })
+                    }),
+                    &no_options(),
+                )
+                .await
+                .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut entered_rx)
+                .await
+                .is_err()
+        );
+        release.send(()).ok();
+        write_first.await.unwrap();
+        write_second.await.unwrap();
+        let document: AuthDocument = serde_json::from_str(&read_file(&dir)).unwrap();
+        assert_eq!(document.get("openai"), Some(&api_key("first")));
+        assert_eq!(document.get("anthropic"), Some(&api_key("second")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_delete_does_not_remove_a_credential() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(store_in(&dir));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let writer = store.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .modify(
+                    "openai",
+                    Box::new(move |_| {
+                        Box::pin(async move {
+                            started.send(()).ok();
+                            wait.await.ok();
+                            Ok(Some(api_key("kept")))
+                        })
+                    }),
+                    &no_options(),
+                )
+                .await
+                .unwrap();
+        });
+        started_rx.await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let deleter = store.clone();
+        let options = AuthOperationOptions::new(token.clone());
+        let delete = tokio::spawn(async move { deleter.delete("openai", &options).await });
+        token.cancel();
+        release.send(()).ok();
+        write.await.unwrap();
+        assert_eq!(delete.await.unwrap(), Err(AuthError::Cancelled));
+        assert_eq!(
+            futures::executor::block_on(store.read("openai", &no_options())).unwrap(),
+            Some(api_key("kept"))
+        );
     }
 
     #[cfg(unix)]

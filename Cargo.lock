@@ -1794,6 +1794,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "base64 0.22.1",
  "clap",
  "dirs",
  "eventsource-stream",

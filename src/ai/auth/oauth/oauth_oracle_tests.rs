@@ -1016,6 +1016,7 @@ mod openai_chatgpt {
         let interaction =
             interaction.with_login_options(Some(Arc::new(crate::ai::auth::types::LoginOptions {
                 get_device_id: Some(Box::new(|| DEVICE_ID.to_string())),
+                ..Default::default()
             })));
         (fake, interaction)
     }
@@ -1172,6 +1173,7 @@ mod openai_chatgpt {
         let interaction = base_interaction.with_login_options(Some(Arc::new(
             crate::ai::auth::types::LoginOptions {
                 get_device_id: Some(Box::new(|| DEVICE_ID.to_string())),
+                ..Default::default()
             },
         )));
 
@@ -1238,6 +1240,7 @@ mod openai_chatgpt {
             .login(interaction_without.with_login_options(Some(Arc::new(
                 crate::ai::auth::types::LoginOptions {
                     get_device_id: Some(Box::new(|| "not-a-uuid".to_string())),
+                    ..Default::default()
                 },
             ))))
             .await

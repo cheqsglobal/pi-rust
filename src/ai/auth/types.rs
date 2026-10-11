@@ -354,6 +354,29 @@ impl ProviderAuthInteraction {
             .and_then(|options| options.get_device_id.as_ref())
             .map(|get_device_id| get_device_id())
     }
+
+    /// App name shown during the first OpenAI dynamic registration.
+    pub fn agent_name_hint(&self) -> Option<String> {
+        self.login_options
+            .as_ref()
+            .and_then(|options| options.agent_name_hint.clone())
+    }
+
+    /// Selected saved OpenAI registration for reauthorization.
+    pub fn existing_registration(&self) -> Option<OpenAIRegistration> {
+        self.login_options
+            .as_ref()
+            .and_then(|options| options.existing_registration.clone())
+    }
+}
+
+/// OpenAI client and verified account mapping retained after tokens are cleared.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenAIRegistration {
+    pub client_id: String,
+    pub subject: String,
+    pub id_token_hint: Option<String>,
+    pub email_hint: Option<String>,
 }
 
 /// Upstream `LoginOptions` (auth/types.ts): app-supplied context for
@@ -365,12 +388,21 @@ pub struct LoginOptions {
     /// apps can create the ID on first use and must return the same ID on
     /// every later call.
     pub get_device_id: Option<Box<dyn Fn() -> String + Send + Sync>>,
+    /// Actual OSS application name for initial OpenAI registration.
+    pub agent_name_hint: Option<String>,
+    /// Existing OpenAI registration selected by the application.
+    pub existing_registration: Option<OpenAIRegistration>,
 }
 
 impl std::fmt::Debug for LoginOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginOptions")
             .field("get_device_id", &self.get_device_id.is_some())
+            .field("agent_name_hint", &self.agent_name_hint)
+            .field(
+                "existing_registration",
+                &self.existing_registration.is_some(),
+            )
             .finish()
     }
 }

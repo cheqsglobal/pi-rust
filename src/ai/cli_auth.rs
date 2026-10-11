@@ -9,8 +9,8 @@
 //! surfaces go through [`AuthInteraction`]:
 //! - Upstream wires `prompt`/`notify` to readline/stdio inside `login`; the
 //!   port receives a caller-built [`AuthInteraction`] (the console impl is
-//!   the CLI's). The flow runs under a fresh, never-cancelled token —
-//!   upstream's `new AbortController().signal`.
+//!   the CLI's). A caller cancellation token is honored through token
+//!   exchange and credential persistence.
 //! - Upstream prints `\nCredentials saved to ${AUTH_FILE}` with
 //!   `console.log`; the port notifies [`AuthEvent::Info`] with the same
 //!   message text ("Credentials saved to auth.json" — upstream hardcodes the
@@ -22,8 +22,6 @@
 //! port's minimal command over it.
 
 use std::sync::Arc;
-
-use tokio_util::sync::CancellationToken;
 
 use crate::ai::auth::credential_store::CredentialStore;
 use crate::ai::auth::types::{
@@ -56,17 +54,26 @@ pub async fn login_with_device_id(
     login_options: Option<std::sync::Arc<crate::ai::auth::types::LoginOptions>>,
     options: &AuthOperationOptions,
 ) -> Result<OAuthCredential, AuthError> {
-    // Upstream: `signal: new AbortController().signal` — a fresh,
-    // never-aborted signal scoped to the login.
-    let normalized = ProviderAuthInteraction::new(interaction.clone(), CancellationToken::new())
+    let signal = options
+        .signal
+        .clone()
+        .or_else(|| interaction.signal())
+        .unwrap_or_default();
+    if signal.is_cancelled() {
+        return Err(AuthError::Cancelled);
+    }
+    let normalized = ProviderAuthInteraction::new(interaction.clone(), signal.clone())
         .with_login_options(login_options);
     let credential = oauth.login(normalized).await?;
+    if signal.is_cancelled() {
+        return Err(AuthError::Cancelled);
+    }
     let stored = credential.clone();
     store
         .modify(
             provider_id,
             Box::new(move |_| Box::pin(async move { Ok(Some(Credential::OAuth(stored))) })),
-            options,
+            &AuthOperationOptions::new(signal),
         )
         .await?;
     // Upstream cli.ts:73 `console.log(\`\nCredentials saved to ${AUTH_FILE}\`)`;
@@ -96,6 +103,7 @@ mod tests {
     use crate::ai::auth::types::{ApiKeyCredential, AuthPrompt, ModelAuth};
     use futures::future::BoxFuture;
     use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     fn no_options() -> AuthOperationOptions {
         AuthOperationOptions::default()
@@ -226,6 +234,56 @@ mod tests {
         assert_eq!(received.len(), 1);
         let signal = received.into_iter().next().unwrap().unwrap();
         assert!(!signal.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_login_does_not_store_tokens_after_the_flow_returns() {
+        struct CancelAtExchange;
+        impl OAuthAuth for CancelAtExchange {
+            fn name(&self) -> &str {
+                "CancelAtExchange"
+            }
+            fn login<'a>(
+                &'a self,
+                interaction: ProviderAuthInteraction,
+            ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
+                Box::pin(async move {
+                    interaction.signal.cancel();
+                    Ok(canned_credential())
+                })
+            }
+            fn refresh<'a>(
+                &'a self,
+                _: OAuthCredential,
+                _: &'a AuthOperationOptions,
+            ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
+                unreachable!()
+            }
+            fn to_auth<'a>(
+                &'a self,
+                _: OAuthCredential,
+            ) -> BoxFuture<'a, Result<ModelAuth, AuthError>> {
+                unreachable!()
+            }
+        }
+        let store = InMemoryStore::default();
+        let interaction = Arc::new(RecordingInteraction {
+            events: Mutex::new(Vec::new()),
+        });
+        let signal = CancellationToken::new();
+        let error = login_with_device_id(
+            &CancelAtExchange,
+            "openai",
+            &store,
+            interaction.clone(),
+            None,
+            &AuthOperationOptions::new(signal),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, AuthError::Cancelled);
+        assert_eq!(store.read("openai", &no_options()).await.unwrap(), None);
+        assert!(interaction.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

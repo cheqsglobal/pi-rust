@@ -24,8 +24,8 @@
 //! - `delete` always rewrites the document, even when the key was absent
 //!   (upstream `AuthStorage.delete` writes the filtered map unconditionally).
 //! - File hygiene follows the `oauth.ts` harness: the parent directory is
-//!   created recursively with mode `0o700` and the file is chmod'd `0o600`
-//!   after every save (unix; other platforms skip the mode calls).
+//!   created recursively with mode `0o700`; writes use a private temporary
+//!   file and atomic replacement with mode `0o600` on Unix.
 //!
 //! Deviations from upstream, disclosed:
 //! - Key order: the document is stored as a `BTreeMap`, so `list` reports
@@ -41,6 +41,7 @@
 //!   [`InMemoryCredentialStore`](super::credential_store::InMemoryCredentialStore).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use futures::future::BoxFuture;
@@ -116,27 +117,41 @@ impl FileCredentialStore {
         Ok(serde_json::from_str(&content).unwrap_or_default())
     }
 
-    /// Upstream `saveAuth` (`writeFileSync(AUTH_FILE, JSON.stringify(auth,
-    /// null, 2))`) plus the `oauth.ts` harness hygiene: parent directory
-    /// (mode `0o700` on unix) and a `0o600` file chmod after the write.
+    /// Write a complete owner-only document beside the destination, then
+    /// atomically replace it so readers never see a partial credential set.
     fn save_document(&self, document: &AuthDocument) -> Result<(), AuthError> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                create_dir_private(parent).map_err(|error| {
-                    AuthError::Storage(format!("could not create {}: {error}", parent.display()))
-                })?;
-            }
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if !parent.exists() {
+            create_dir_private(parent).map_err(|error| {
+                AuthError::Storage(format!("could not create {}: {error}", parent.display()))
+            })?;
         }
         let body = serde_json::to_string_pretty(document).map_err(|error| {
             AuthError::Storage(format!("could not serialize auth.json: {error}"))
         })?;
-        std::fs::write(&self.path, body).map_err(|error| {
-            AuthError::Storage(format!("could not write {}: {error}", self.path.display()))
+        let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            AuthError::Storage(format!("could not create credential temp file: {error}"))
         })?;
-        restrict_file_mode(&self.path).map_err(|error| {
+        restrict_file_mode(file.path()).map_err(|error| {
             AuthError::Storage(format!(
-                "could not restrict {}: {error}",
+                "could not restrict credential temp file for {}: {error}",
                 self.path.display()
+            ))
+        })?;
+        file.write_all(body.as_bytes())
+            .and_then(|_| file.as_file().sync_all())
+            .map_err(|error| {
+                AuthError::Storage(format!("could not write {}: {error}", self.path.display()))
+            })?;
+        file.persist(&self.path).map_err(|error| {
+            AuthError::Storage(format!(
+                "could not replace {}: {}",
+                self.path.display(),
+                error.error
             ))
         })?;
         Ok(())
@@ -159,7 +174,7 @@ fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The `oauth.ts` harness `chmodSync(AUTH_PATH, 0o600)` after every save.
+/// Restrict the temporary credential file before it receives secrets.
 fn restrict_file_mode(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -630,5 +645,27 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_restricts_an_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = FileCredentialStore::new(&path);
+        futures::executor::block_on(store.modify(
+            "openai",
+            Box::new(|_| Box::pin(async { Ok(Some(api_key("private"))) })),
+            &no_options(),
+        ))
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

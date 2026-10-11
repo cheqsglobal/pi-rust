@@ -6,10 +6,9 @@
 //! [`OAuthAuth`] implementation.
 //!
 //! This public-client flow uses no client secret and sends the resulting user
-//! access token directly to api.openai.com. Every login registers a new
-//! client with the fixed `dynamic_agent_client` ID; OpenAI returns the issued
-//! client ID in the callback, and it is stored on the credential (upstream
-//! `clientId`, the port's `extra` map) and reused by refresh.
+//! access token directly to api.openai.com. Initial login registers a client
+//! with `dynamic_agent_client`; returning login reuses the issued client ID
+//! saved with the verified account identity.
 //!
 //! Interactive surface (M2d ruling): the browser gets the authorize URL via
 //! [`AuthEvent::AuthUrl`], the user's pasted final redirect URL arrives
@@ -53,9 +52,15 @@
 //!   capture's deterministic byte stream through [`super::test_entropy`].
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use futures::future::BoxFuture;
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::signature::Verifier;
+use rsa::{BoxedUint, RsaPublicKey};
 use serde_json::Value;
+use sha2::Sha256;
 use tokio_util::sync::CancellationToken;
 
 use crate::ai::api::azure_openai_responses::get_provider_env_value;
@@ -85,6 +90,8 @@ const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 /// Upstream `TOKEN_URL`; the production default for
 /// [`OpenAIChatGptOAuth::new`].
 const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
+const JWKS_URL: &str = "https://auth.openai.com/.well-known/jwks.json";
+const ISSUER: &str = "https://auth.openai.com";
 
 /// Upstream `RESOURCE`.
 const RESOURCE: &str = "https://api.openai.com/v1";
@@ -173,6 +180,7 @@ fn agent_host_id(device_id: Option<&str>) -> Result<String, AuthError> {
 fn authorization_result_from_callback(
     params: &[(String, String)],
     expected_state: &str,
+    returning_client_id: Option<&str>,
 ) -> Result<AuthorizationResult, AuthError> {
     let get = |name: &str| first_pair(params, name);
     // `if (!code)` truthiness.
@@ -193,6 +201,14 @@ fn authorization_result_from_callback(
     let client_id = get("client_id")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    if let (Some(expected), Some(actual)) = (returning_client_id, client_id.as_deref()) {
+        if actual != expected {
+            return Err(AuthError::Operation(
+                "OpenAI OAuth client ID mismatch".to_string(),
+            ));
+        }
+    }
+    let client_id = client_id.or_else(|| returning_client_id.map(str::to_string));
     let Some(client_id) = client_id else {
         return Err(AuthError::Operation(
             "OpenAI OAuth registration callback did not contain an issued client ID".to_string(),
@@ -214,10 +230,11 @@ fn url_origin(url: &url::Url) -> String {
 
 /// Upstream `authorizationResultFromManualInput`: parse the pasted final
 /// redirect URL, require the callback origin/path, then the callback fields.
-fn authorization_result_from_manual_input(
+fn authorization_result_from_manual_input_for_client(
     input: &str,
     expected_state: &str,
     redirect_uri: &str,
+    returning_client_id: Option<&str>,
 ) -> Result<AuthorizationResult, AuthError> {
     let trimmed = input.trim();
     let url = url::Url::parse(trimmed).map_err(|_| {
@@ -249,7 +266,16 @@ fn authorization_result_from_manual_input(
         .query_pairs()
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect();
-    authorization_result_from_callback(&params, expected_state)
+    authorization_result_from_callback(&params, expected_state, returning_client_id)
+}
+
+#[cfg(test)]
+fn authorization_result_from_manual_input(
+    input: &str,
+    expected_state: &str,
+    redirect_uri: &str,
+) -> Result<AuthorizationResult, AuthError> {
+    authorization_result_from_manual_input_for_client(input, expected_state, redirect_uri, None)
 }
 
 /// The flow-local loopback callback server (upstream `startCallbackServer`,
@@ -270,6 +296,7 @@ impl ChatGptCallbackServer {
         expected_state: String,
         callback_host: &str,
         callback_port: u16,
+        returning_client_id: Option<String>,
     ) -> Result<ChatGptCallbackServer, AuthError> {
         let listener = tokio::net::TcpListener::bind((callback_host, callback_port))
             .await
@@ -290,6 +317,7 @@ impl ChatGptCallbackServer {
         let task_shutdown = shutdown.clone();
         let loop_result = result.clone();
         let loop_state = expected_state;
+        let loop_client_id = returning_client_id;
         let accept_loop = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -300,9 +328,11 @@ impl ChatGptCallbackServer {
                         Ok((stream, _)) => {
                             let result = loop_result.clone();
                             let expected_state = loop_state.clone();
+                            let returning_client_id = loop_client_id.clone();
                             tokio::spawn(handle_connection(
                                 stream,
                                 expected_state,
+                                returning_client_id,
                                 result,
                             ));
                         }
@@ -361,6 +391,7 @@ async fn send_html(stream: &mut tokio::net::TcpStream, status: u16, reason: &str
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     expected_state: String,
+    returning_client_id: Option<String>,
     result: Waiter<Result<AuthorizationResult, AuthError>>,
 ) {
     let Some(request_line) = read_request_head(&mut stream).await else {
@@ -408,6 +439,16 @@ async fn handle_connection(
         .collect();
     // `const error = url.searchParams.get("error"); if (error)` — truthiness.
     if let Some(error) = first_pair(&params, "error").filter(|value| !value.is_empty()) {
+        if first_pair(&params, "state").as_deref() != Some(expected_state.as_str()) {
+            send_html(
+                &mut stream,
+                400,
+                "Bad Request",
+                &oauth_error_html("OAuth state mismatch", None),
+            )
+            .await;
+            return;
+        }
         send_html(
             &mut stream,
             400,
@@ -426,7 +467,11 @@ async fn handle_connection(
 
     // Callback-field validation failures render their message and keep the
     // login waiting (no rejection).
-    match authorization_result_from_callback(&params, &expected_state) {
+    match authorization_result_from_callback(
+        &params,
+        &expected_state,
+        returning_client_id.as_deref(),
+    ) {
         Ok(authorization_result) => {
             send_html(
                 &mut stream,
@@ -461,6 +506,87 @@ struct TokenResponse {
     expires_in: Option<Value>,
     id_token: Option<Value>,
     scope: Option<Value>,
+}
+
+/// Verify the ID token before its identity or tokens can be stored. The
+/// production JWKS endpoint currently publishes RS256 RSA keys; reject any
+/// other algorithm instead of accepting an unverified identity.
+async fn verify_id_token(
+    id_token: &str,
+    jwks_url: &str,
+    client_id: &str,
+    nonce: &str,
+    signal: &CancellationToken,
+) -> Result<(String, Option<String>), AuthError> {
+    let invalid = || AuthError::Operation("OpenAI returned an invalid ID token".to_string());
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let decode = |part: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| invalid())
+    };
+    let header: Value = serde_json::from_slice(&decode(parts[0])?).map_err(|_| invalid())?;
+    let claims: Value = serde_json::from_slice(&decode(parts[1])?).map_err(|_| invalid())?;
+    if header["alg"] != "RS256" {
+        return Err(invalid());
+    }
+    let kid = header["kid"].as_str().ok_or_else(invalid)?;
+    let response = tokio::select! {
+        _ = signal.cancelled() => return Err(AuthError::Cancelled),
+        response = http_client().get(jwks_url).send() => response.map_err(|_| invalid())?,
+    };
+    if !response.status().is_success() {
+        return Err(invalid());
+    }
+    let jwks: Value = tokio::select! {
+        _ = signal.cancelled() => return Err(AuthError::Cancelled),
+        value = response.json() => value.map_err(|_| invalid())?,
+    };
+    let key = jwks["keys"]
+        .as_array()
+        .and_then(|keys| {
+            keys.iter().find(|key| {
+                key["kid"] == kid
+                    && key["kty"] == "RSA"
+                    && (key["alg"].is_null() || key["alg"] == "RS256")
+            })
+        })
+        .ok_or_else(invalid)?;
+    let modulus_bytes = decode(key["n"].as_str().ok_or_else(invalid)?)?;
+    let exponent_bytes = decode(key["e"].as_str().ok_or_else(invalid)?)?;
+    let modulus = BoxedUint::from_be_slice(&modulus_bytes, (modulus_bytes.len() * 8) as u32)
+        .map_err(|_| invalid())?;
+    let exponent = BoxedUint::from_be_slice(&exponent_bytes, (exponent_bytes.len() * 8) as u32)
+        .map_err(|_| invalid())?;
+    let public_key = RsaPublicKey::new(modulus, exponent).map_err(|_| invalid())?;
+    let signature = Signature::try_from(decode(parts[2])?.as_slice()).map_err(|_| invalid())?;
+    VerifyingKey::<Sha256>::new(public_key)
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .map_err(|_| invalid())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid())?
+        .as_secs();
+    let audience_matches = claims["aud"].as_str() == Some(client_id)
+        || claims["aud"]
+            .as_array()
+            .is_some_and(|aud| aud.iter().any(|entry| entry.as_str() == Some(client_id)));
+    if claims["iss"] != ISSUER
+        || !audience_matches
+        || claims["exp"].as_u64().is_none_or(|exp| exp <= now)
+        || claims["nonce"] != nonce
+    {
+        return Err(invalid());
+    }
+    let subject = claims["sub"]
+        .as_str()
+        .filter(|sub| !sub.is_empty())
+        .ok_or_else(invalid)?;
+    let email = claims["email"].as_str().map(str::to_string);
+    Ok((subject.to_string(), email))
 }
 
 /// Upstream `requestToken`: POST the form body to the token endpoint with the
@@ -580,13 +706,16 @@ fn credential_from_token_response(
 
 /// Upstream `exchangeAuthorizationCode`: the grant carries grant_type,
 /// client_id, code, code_verifier, redirect_uri and resource — in that
-/// order — and the response must carry an ID token (presence check only; Pi
-/// does not read profile data from it).
+/// order. Production login validates the returned ID token against OpenAI's
+/// JWKS before storing identity or credentials.
 async fn exchange_authorization_code(
     token_url: &str,
+    jwks_url: Option<&str>,
     code: &str,
     verifier: &str,
     client_id: &str,
+    nonce: &str,
+    returning_subject: Option<&str>,
     redirect_uri: &str,
     signal: &CancellationToken,
 ) -> Result<OAuthCredential, AuthError> {
@@ -607,12 +736,41 @@ async fn exchange_authorization_code(
         .as_ref()
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty());
-    if id_token.is_none() {
+    let Some(id_token) = id_token else {
         return Err(AuthError::Operation(
             "OpenAI OAuth token response did not contain an ID token".to_string(),
         ));
+    };
+    let mut credential = credential_from_token_response(&token, client_id)?;
+    if let Some(jwks_url) = jwks_url {
+        let (subject, email) =
+            verify_id_token(id_token, jwks_url, client_id, nonce, signal).await?;
+        require_selected_subject(&subject, returning_subject)?;
+        credential
+            .extra
+            .insert("subject".to_string(), Value::String(subject));
+        credential
+            .extra
+            .insert("idToken".to_string(), Value::String(id_token.to_string()));
+        credential
+            .extra
+            .insert("issuer".to_string(), Value::String(ISSUER.to_string()));
+        if let Some(email) = email {
+            credential
+                .extra
+                .insert("email".to_string(), Value::String(email));
+        }
     }
-    credential_from_token_response(&token, client_id)
+    Ok(credential)
+}
+
+fn require_selected_subject(subject: &str, selected: Option<&str>) -> Result<(), AuthError> {
+    if selected.is_some_and(|expected| expected != subject) {
+        return Err(AuthError::Operation(
+            "OpenAI account did not match the selected registration".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Upstream `refreshAccessToken`: refresh with the stored issued client ID.
@@ -643,7 +801,13 @@ async fn refresh_access_token(
         query.finish()
     };
     let token = request_token(token_url, body, signal).await?;
-    credential_from_token_response(&token, &client_id)
+    let mut refreshed = credential_from_token_response(&token, &client_id)?;
+    for name in ["subject", "idToken", "issuer", "email"] {
+        if let Some(value) = credential.extra.get(name) {
+            refreshed.extra.insert(name.to_string(), value.clone());
+        }
+    }
+    Ok(refreshed)
 }
 
 /// Upstream `loginOpenAIChatGPT` (openai-chatgpt.ts:237-305).
@@ -660,6 +824,20 @@ async fn login_openai_chatgpt(
     } = generate_pkce();
     let state = random_value();
     let nonce = random_value();
+    let existing = interaction.existing_registration();
+    if existing.as_ref().is_some_and(|registration| {
+        registration.client_id.is_empty() || registration.subject.is_empty()
+    }) {
+        return Err(AuthError::Operation(
+            "Saved OpenAI registration is incomplete".to_string(),
+        ));
+    }
+    let returning_client_id = existing
+        .as_ref()
+        .map(|registration| registration.client_id.as_str());
+    let returning_subject = existing
+        .as_ref()
+        .map(|registration| registration.subject.as_str());
 
     // v1.0.0: without this server, the browser's callback would reach
     // whatever else holds the port (another pending login or the Codex CLI),
@@ -669,6 +847,7 @@ async fn login_openai_chatgpt(
         state.clone(),
         &oauth.callback_host,
         oauth.callback_port,
+        returning_client_id.map(str::to_string),
     )
     .await
     {
@@ -691,9 +870,32 @@ async fn login_openai_chatgpt(
     // insertion order preserved, form-urlencoded serialization.
     let authorization_url = {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("client_id", DYNAMIC_CLIENT_ID);
-        query.append_pair("agent_name_hint", AGENT_NAME_HINT);
+        query.append_pair(
+            "client_id",
+            returning_client_id.unwrap_or(DYNAMIC_CLIENT_ID),
+        );
+        if returning_client_id.is_none() {
+            query.append_pair(
+                "agent_name_hint",
+                interaction
+                    .agent_name_hint()
+                    .as_deref()
+                    .unwrap_or(AGENT_NAME_HINT),
+            );
+        }
         query.append_pair("ext_agent_host_id", &host_id);
+        if let Some(id_token) = existing
+            .as_ref()
+            .and_then(|registration| registration.id_token_hint.as_deref())
+        {
+            query.append_pair("id_token_hint", id_token);
+        }
+        if let Some(email) = existing
+            .as_ref()
+            .and_then(|registration| registration.email_hint.as_deref())
+        {
+            query.append_pair("login_hint", email);
+        }
         query.append_pair("response_type", "code");
         query.append_pair("redirect_uri", &redirect_uri);
         query.append_pair("resource", RESOURCE);
@@ -740,7 +942,12 @@ async fn login_openai_chatgpt(
                 },
             })
             .await?;
-        authorization_result_from_manual_input(&input, &state, &redirect_uri)
+        authorization_result_from_manual_input_for_client(
+            &input,
+            &state,
+            &redirect_uri,
+            returning_client_id,
+        )
     });
 
     // `await (callback ? Promise.race([callback.result, manualCode]) :
@@ -762,9 +969,12 @@ async fn login_openai_chatgpt(
         });
         exchange_authorization_code(
             &oauth.token_url,
+            oauth.jwks_url.as_deref(),
             &result.code,
             &verifier,
             &result.client_id,
+            &nonce,
+            returning_subject,
             &redirect_uri,
             &interaction.signal,
         )
@@ -796,6 +1006,7 @@ async fn login_openai_chatgpt(
 /// endpoints; tests inject a wiremock token URL and callback host/port.
 pub struct OpenAIChatGptOAuth {
     token_url: String,
+    jwks_url: Option<String>,
     callback_host: String,
     callback_port: u16,
 }
@@ -815,6 +1026,7 @@ impl OpenAIChatGptOAuth {
             .unwrap_or_else(|| DEFAULT_CALLBACK_HOST.to_string());
         OpenAIChatGptOAuth {
             token_url: TOKEN_URL.to_string(),
+            jwks_url: Some(JWKS_URL.to_string()),
             callback_host,
             callback_port: CALLBACK_PORT,
         }
@@ -832,6 +1044,7 @@ impl OpenAIChatGptOAuth {
     ) -> Self {
         OpenAIChatGptOAuth {
             token_url,
+            jwks_url: None,
             callback_host,
             callback_port,
         }
@@ -927,7 +1140,13 @@ mod tests {
     use super::*;
     use crate::ai::auth::oauth::parse_urlencoded_pairs;
     use crate::ai::auth::oauth::pkce::base64url_encode;
-    use crate::ai::auth::types::{AuthInteraction, AuthOperationOptions, LoginOptions};
+    use crate::ai::auth::types::{
+        AuthInteraction, AuthOperationOptions, LoginOptions, OpenAIRegistration,
+    };
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
     use sha2::{Digest, Sha256};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -935,6 +1154,182 @@ mod tests {
     use url::Url;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn id_token_requires_valid_signature_issuer_audience_expiry_and_nonce() {
+        let private_key = RsaPrivateKey::new(&mut rand::rng(), 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [{
+                    "kid": "test", "kty": "RSA", "alg": "RS256",
+                    "n": base64url_encode(&public_key.n().as_ref().to_be_bytes_trimmed_vartime()),
+                    "e": base64url_encode(&public_key.e().to_be_bytes_trimmed_vartime()),
+                }]})),
+            )
+            .mount(&server)
+            .await;
+        let header = base64url_encode(br#"{"alg":"RS256","kid":"test"}"#);
+        let sign = |claims: Value| {
+            let payload = base64url_encode(serde_json::to_vec(&claims).unwrap().as_slice());
+            let input = format!("{header}.{payload}");
+            let signature = SigningKey::<Sha256>::new(private_key.clone())
+                .sign_with_rng(&mut rand::rng(), input.as_bytes());
+            format!("{input}.{}", base64url_encode(&signature.to_vec()))
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({
+            "iss": ISSUER, "aud": "oaiapp_test", "exp": now + 3600,
+            "nonce": "expected", "sub": "account-1", "email": "a@example.com"
+        });
+        let jwks_url = format!("{}/jwks", server.uri());
+        let signal = CancellationToken::new();
+        assert_eq!(
+            verify_id_token(
+                &sign(claims.clone()),
+                &jwks_url,
+                "oaiapp_test",
+                "expected",
+                &signal
+            )
+            .await
+            .unwrap(),
+            ("account-1".to_string(), Some("a@example.com".to_string()))
+        );
+        let no_alg_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [{
+                    "kid": "test", "kty": "RSA",
+                    "n": base64url_encode(&public_key.n().as_ref().to_be_bytes_trimmed_vartime()),
+                    "e": base64url_encode(&public_key.e().to_be_bytes_trimmed_vartime()),
+                }]})),
+            )
+            .mount(&no_alg_server)
+            .await;
+        assert!(verify_id_token(
+            &sign(claims.clone()),
+            &format!("{}/jwks", no_alg_server.uri()),
+            "oaiapp_test",
+            "expected",
+            &signal
+        )
+        .await
+        .is_ok());
+        for (field, value) in [
+            ("iss", serde_json::json!("https://evil.example")),
+            ("aud", serde_json::json!("another-client")),
+            ("exp", serde_json::json!(now - 1)),
+            ("nonce", serde_json::json!("wrong")),
+        ] {
+            let mut altered = claims.clone();
+            altered[field] = value;
+            assert!(
+                verify_id_token(
+                    &sign(altered),
+                    &jwks_url,
+                    "oaiapp_test",
+                    "expected",
+                    &signal
+                )
+                .await
+                .is_err(),
+                "{field}"
+            );
+        }
+        let valid = sign(claims);
+        let mut segments: Vec<String> = valid.split('.').map(str::to_string).collect();
+        let mut signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&segments[2])
+            .unwrap();
+        signature[0] ^= 1;
+        segments[2] = base64url_encode(&signature);
+        assert!(verify_id_token(
+            &segments.join("."),
+            &jwks_url,
+            "oaiapp_test",
+            "expected",
+            &signal
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn returning_callback_uses_saved_client_id_and_rejects_a_different_one() {
+        let query = vec![
+            ("code".to_string(), "code".to_string()),
+            ("state".to_string(), "state".to_string()),
+        ];
+        let result =
+            authorization_result_from_callback(&query, "state", Some("oaiapp_saved")).unwrap();
+        assert_eq!(result.client_id, "oaiapp_saved");
+        let mut wrong = query;
+        wrong.push(("client_id".to_string(), "oaiapp_other".to_string()));
+        assert!(authorization_result_from_callback(&wrong, "state", Some("oaiapp_saved")).is_err());
+        assert!(require_selected_subject("different-account", Some("saved-account")).is_err());
+        assert!(require_selected_subject("saved-account", Some("saved-account")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn moonx_sign_in_uses_its_name_and_reuses_a_saved_registration() {
+        let server = MockServer::start().await;
+        mount_token_endpoint(&server, token_body_json(REQUIRED_SCOPE), 200).await;
+        for existing in [
+            None,
+            Some(OpenAIRegistration {
+                client_id: "oaiapp_saved".to_string(),
+                subject: "account-1".to_string(),
+                id_token_hint: Some("old-id-token".to_string()),
+                email_hint: Some("a@example.com".to_string()),
+            }),
+        ] {
+            let port = free_callback_port();
+            let oauth = flow_with(&server, port);
+            let (fake, interaction) = fake_interaction(hanging_respond());
+            let interaction = interaction.with_login_options(Some(Arc::new(LoginOptions {
+                get_device_id: Some(Box::new(|| {
+                    "e61bbe28-07ef-466d-8e5d-a344f94ab305".to_string()
+                })),
+                agent_name_hint: Some("MoonX".to_string()),
+                existing_registration: existing.clone(),
+            })));
+            let auth_url_slot = Arc::clone(&fake.auth_url);
+            let driver = tokio::spawn(async move {
+                let auth_url = wait_for_auth_url(auth_url_slot).await;
+                let state = auth_url_param(&auth_url, "state");
+                let callback = if existing.is_some() {
+                    format!("/auth/callback?code=code&state={state}")
+                } else {
+                    format!("/auth/callback?code=code&state={state}&client_id=oaiapp_issued")
+                };
+                http_get(port, &callback).await;
+                auth_url
+            });
+            let credential = oauth.login(interaction).await.unwrap();
+            let url = Url::parse(&driver.await.unwrap()).unwrap();
+            let param = |name: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.into_owned())
+            };
+            if credential.extra["clientId"] == "oaiapp_saved" {
+                assert_eq!(param("client_id").as_deref(), Some("oaiapp_saved"));
+                assert_eq!(param("agent_name_hint"), None);
+                assert_eq!(param("id_token_hint").as_deref(), Some("old-id-token"));
+                assert_eq!(param("login_hint").as_deref(), Some("a@example.com"));
+            } else {
+                assert_eq!(param("client_id").as_deref(), Some(DYNAMIC_CLIENT_ID));
+                assert_eq!(param("agent_name_hint").as_deref(), Some("MoonX"));
+            }
+        }
+    }
 
     type Respond =
         Box<dyn Fn(AuthPrompt) -> BoxFuture<'static, Result<String, AuthError>> + Send + Sync>;
@@ -990,6 +1385,7 @@ mod tests {
             get_device_id: Some(Box::new(|| {
                 "e61bbe28-07ef-466d-8e5d-a344f94ab305".to_string()
             })),
+            ..LoginOptions::default()
         })));
         (fake, interaction)
     }
@@ -1369,9 +1765,12 @@ mod tests {
 
         let error = exchange_authorization_code(
             &token_url,
+            None,
             "code",
             "verifier",
             "client",
+            "nonce",
+            None,
             "http://127.0.0.1:1455/auth/callback",
             &signal,
         )
@@ -1834,9 +2233,10 @@ mod tests {
     #[tokio::test]
     async fn callback_server_routes_follow_the_upstream_order() {
         let port = free_callback_port();
-        let server = ChatGptCallbackServer::start("expected-state".to_string(), "127.0.0.1", port)
-            .await
-            .unwrap();
+        let server =
+            ChatGptCallbackServer::start("expected-state".to_string(), "127.0.0.1", port, None)
+                .await
+                .unwrap();
 
         // Wrong path: 404 "Callback route not found."
         let response = http_get(port, "/nope?code=c&state=expected-state").await;
@@ -1863,10 +2263,13 @@ mod tests {
         server.close().await;
 
         // A fresh server: field validation keeps waiting, success settles.
-        let server = ChatGptCallbackServer::start("expected-state".to_string(), "127.0.0.1", port)
-            .await
-            .unwrap();
+        let server =
+            ChatGptCallbackServer::start("expected-state".to_string(), "127.0.0.1", port, None)
+                .await
+                .unwrap();
         let response = http_get(port, "/auth/callback?code=c&state=wrong").await;
+        assert!(response.contains("OAuth state mismatch"));
+        let response = http_get(port, "/auth/callback?error=access_denied&state=wrong").await;
         assert!(response.contains("OAuth state mismatch"));
         let response = http_get(port, "/auth/callback?state=expected-state").await;
         assert!(response.contains("Missing authorization code"));

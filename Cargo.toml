@@ -48,6 +48,8 @@ dirs = "7.0.0"
 eventsource-stream = "0.2.3"
 futures = "0.3.34"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
+base64 = "=0.22.1"
+tempfile = "3.27.0"
 rustyline = "18.0.1"
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -148,7 +150,6 @@ version = "=2.3.0"
 windows-registry = "=0.6.1"
 
 [dev-dependencies]
-tempfile = "3.27.0"
 # Spill drain/writer deadlock regression test (M3b Task 6): fails the spill
 # writer deterministically via a mandatory byte-range lock (Windows
 # LockFileEx; advisory flock on unix).
